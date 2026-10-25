@@ -1,4 +1,4 @@
-> 本 fork 的 V2 2.8.80 增加了 [STRM 软链接同步删除](docs/p115strmhelper/SYMLINK_SYNC_DELETE.md)，解决 issue #435；新模式默认关闭，使用前请阅读启用步骤及删除边界。
+> 本 fork 的 V2 2.8.81 增加了 [STRM 软链接同步删除](docs/p115strmhelper/SYMLINK_SYNC_DELETE.md)，解决 issue #435；新模式默认关闭，使用前请阅读启用步骤及删除边界。
 
 # MoviePilot-Plugins
 

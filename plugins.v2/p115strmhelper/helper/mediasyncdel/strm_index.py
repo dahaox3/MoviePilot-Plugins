@@ -62,6 +62,7 @@ class StrmPathIndex:
         self._lock = RLock()
         self._records: Dict[Path, StrmTarget] = {}
         self._invalid: Dict[Path, str] = {}
+        self._completed: Dict[Path, Tuple[Tuple[int, int, int, int], float]] = {}
         self._mappings: Tuple[Tuple[str, str, str], ...] = ()
         self._observer: Any = None
         self._scanner: Optional[Thread] = None
@@ -129,6 +130,11 @@ class StrmPathIndex:
             for p, r in self._records.items()
             if not r.deleted_at or now - r.deleted_at <= self.RETENTION
         }
+        self._completed = {
+            p: value
+            for p, value in self._completed.items()
+            if now - value[1] <= self.RETENTION
+        }
 
     def _scan(self, root: Path) -> None:
         self._no_link_parents(root / "placeholder")
@@ -148,6 +154,9 @@ class StrmPathIndex:
         self._records.pop(path, None)
         self._invalid.pop(path, None)
         try:
+            completed = self._completed.get(path)
+            if completed and self._identity(path) == completed[0]:
+                return
             if len(self._records) + len(self._invalid) >= self.MAX_ENTRIES:
                 raise OverflowError("STRM 路径索引超过容量限制")
             self._records[path] = self._snapshot(path)
@@ -169,9 +178,10 @@ class StrmPathIndex:
                 if local in {Path(m[1]) for m in self._mappings}:
                     self._ready = False
                 for item in affected:
-                    self._records[item] = replace(
-                        self._records[item], deleted_at=monotonic()
-                    )
+                    if not self._records[item].deleted_at:
+                        self._records[item] = replace(
+                            self._records[item], deleted_at=monotonic()
+                        )
                 return
             for item in affected:
                 self._records.pop(item, None)
@@ -272,7 +282,25 @@ class StrmPathIndex:
             self._scanner = None
             self._records.clear()
             self._invalid.clear()
+            self._completed.clear()
             self._mappings = ()
+
+    def was_completed(self, target: StrmTarget) -> bool:
+        """识别当前生命周期中已经成功处理的同一份 STRM 快照"""
+        with self._lock:
+            self._prune()
+            completed = self._completed.get(target.source)
+            return bool(completed and completed[0] == target.identity)
+
+    def mark_completed(self, target: StrmTarget) -> None:
+        """成功删除后移除旧快照，防止后续整季事件再次包含已删除分集"""
+        with self._lock:
+            self._prune()
+            self._completed[target.source] = (target.identity, monotonic())
+            current = self._records.get(target.source)
+            if current and current.identity == target.identity:
+                self._records.pop(target.source, None)
+                self._invalid.pop(target.source, None)
 
     def capture(self, media_path: str, paths: str) -> StrmDeletePlan:
         """将 Emby 路径转换成受配置范围约束的文件计划，失效或未知路径不回退目录删除"""

@@ -60,6 +60,7 @@ def _load_helper():
         StrmDeletePlan=INDEX.StrmDeletePlan,
         StrmPathIndex=INDEX.StrmPathIndex,
         StrmTarget=INDEX.StrmTarget,
+        strm_path_index=INDEX.StrmPathIndex(),
         configer=SimpleNamespace(storage_module="u115", sync_del_remove_versions=False),
         settings=SimpleNamespace(RMT_MEDIAEXT=[".mkv", ".mp4", ".iso"]),
         WebhookUtils=SimpleNamespace(
@@ -291,6 +292,40 @@ class TestStrmPathIndex(TestCase):
         for name in ("normal", "hard"):
             self.assertTrue(self.index.capture(f"/emby/{name}.strm", self.paths).error)
 
+    def test_successful_episode_is_excluded_from_later_season_plan(self):
+        """先成功删单集再删整季时不能再次校验已删除的原始 STRM"""
+        first, original = self._link("Show/E1.strm")
+        second, _ = self._link("Show/E2.strm")
+        self._start()
+        first_plan = self.index.capture("/emby/Show/E1.strm", self.paths)
+        first.unlink()
+        self.index.mark_completed(first_plan.targets[0])
+        original.unlink()
+        rmtree(second.parent)
+        plan = self.index.capture("/emby/Show", self.paths)
+        self.assertFalse(plan.error)
+        self.assertEqual([t.source.name for t in plan.targets], ["E2.strm"])
+
+    def test_completed_live_symlink_is_not_reintroduced_by_rescan(self):
+        """成功但仍留在本地的同一链接不会被目录扫描重新加入删除计划"""
+        self._link("Show/E1.strm")
+        self._link("Show/E2.strm")
+        self._start()
+        first = self.index.capture("/emby/Show/E1.strm", self.paths).targets[0]
+        self.index.mark_completed(first)
+        plan = self.index.capture("/emby/Show", self.paths)
+        self.assertFalse(plan.error)
+        self.assertEqual([t.source.name for t in plan.targets], ["E2.strm"])
+
+    def test_directory_delete_does_not_refresh_old_deleted_timestamp(self):
+        """父目录删除不能延长旧分集快照的有效期"""
+        source, _ = self._link("Show/E1.strm")
+        self._start()
+        old = replace(self.index._records[source], deleted_at=monotonic() - 100)
+        self.index._records[source] = old
+        self.index._event(str(source.parent), True, True)
+        self.assertEqual(self.index._records[source].deleted_at, old.deleted_at)
+
 
 @skipUnless(sys.platform.startswith("linux"), "STRM 目标删除仅支持 Linux 容器路径")
 class TestExactStrmDelete(TestCase):
@@ -365,6 +400,7 @@ class TestExactStrmDelete(TestCase):
                     episode,
                 )
                 self.ns["configer"].sync_del_remove_versions = versions
+                self.ns["strm_path_index"] = INDEX.StrmPathIndex()
                 self.helper.transferhis.reset_mock()
                 self.assertIsNotNone(self._run())
                 self.helper.transferhis.get_by.assert_not_called()
@@ -500,3 +536,16 @@ class TestExactStrmDelete(TestCase):
         self.helper.storagechain.delete_file.return_value = None
         self.assertIsNone(self._run())
         self.helper.transferhis.delete.assert_not_called()
+
+    def test_duplicate_webhook_does_not_repeat_cloud_delete(self):
+        """成功处理过的快照在另一条重复通知中不再删除网盘文件"""
+        self.assertIsNotNone(self._run())
+        self.assertIsNone(self._run())
+        self.helper.storagechain.delete_file.assert_called_once()
+
+    def test_failed_cloud_delete_can_be_retried(self):
+        """失败调用不标记完成，下次通知仍可重试"""
+        self.helper.storagechain.delete_file.side_effect = [False, True]
+        self.assertIsNone(self._run())
+        self.assertIsNotNone(self._run())
+        self.assertEqual(self.helper.storagechain.delete_file.call_count, 2)

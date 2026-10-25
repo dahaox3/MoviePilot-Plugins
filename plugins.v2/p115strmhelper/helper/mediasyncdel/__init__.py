@@ -24,7 +24,7 @@ from ...utils.path import PathUtils, PathRemoveUtils
 from ...utils.sentry import sentry_manager
 from ...utils.webhook import WebhookUtils
 
-from .strm_index import StrmDeletePlan, StrmPathIndex, StrmTarget
+from .strm_index import StrmDeletePlan, StrmPathIndex, StrmTarget, strm_path_index
 
 
 @sentry_manager.capture_all_class_exceptions
@@ -764,6 +764,8 @@ class MediaSyncDelHelper:
                     continue
                 for target in plan.targets:
                     try:
+                        if strm_path_index.was_completed(target):
+                            continue
                         local_history = self.transferhis.get_by_dest(str(target.source))
                         if local_history and target.linked:
                             if (
@@ -795,6 +797,7 @@ class MediaSyncDelHelper:
                         )
                         processed_remote_paths.add(remote_path)
                         if result:
+                            strm_path_index.mark_completed(target)
                             if local_history and target.linked:
                                 self.transferhis.delete(local_history.id)
                             results.append(result)
