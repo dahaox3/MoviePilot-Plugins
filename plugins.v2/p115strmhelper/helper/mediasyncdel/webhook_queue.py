@@ -1,10 +1,12 @@
 from dataclasses import dataclass
 from queue import Queue
 from threading import Lock, Thread
-from typing import Optional
+from typing import Dict, Optional
 
 from app.log import logger
 from app.schemas.mediaserver import WebhookEventInfo
+
+from .strm_index import StrmDeletePlan
 
 
 @dataclass
@@ -18,6 +20,7 @@ class SyncDelWebhookTask:
     :param del_source (bool): 是否删除源文件
     :param p115_library_path (str): 115 媒体库路径映射
     :param p115_force_delete_files (bool): 是否强制删除无 TMDB 的文件
+    :param strm_delete_plans (Dict): 入队时冻结的文件级路径计划，None 为原模式
     """
 
     event_data: WebhookEventInfo
@@ -26,6 +29,7 @@ class SyncDelWebhookTask:
     del_source: bool
     p115_library_path: Optional[str]
     p115_force_delete_files: bool
+    strm_delete_plans: Optional[Dict[str, StrmDeletePlan]] = None
 
 
 class SyncDelWebhookQueue:
@@ -70,6 +74,7 @@ class SyncDelWebhookQueue:
                     del_source=task.del_source,
                     p115_library_path=task.p115_library_path,
                     p115_force_delete_files=task.p115_force_delete_files,
+                    strm_delete_plans=task.strm_delete_plans,
                 )
             except Exception as e:
                 logger.error(

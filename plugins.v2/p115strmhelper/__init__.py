@@ -72,6 +72,7 @@ from .helper.strm import (
 from .helper.hdhive.browser import is_hdhive_search_ready
 from .helper.strm.full import strm_cleanup_interaction
 from .helper.mediasyncdel import MediaSyncDelHelper
+from .helper.mediasyncdel.strm_index import strm_path_index
 from .helper.mediasyncdel.webhook_queue import (
     SyncDelWebhookTask,
     sync_del_webhook_queue,
@@ -82,6 +83,7 @@ from .utils.sentry import sentry_manager
 from .helper.share.share_links import ShareLinkResolver
 from .utils.rename_dict import RenameDictUtils
 from .utils.url import UrlUtils
+from .utils.webhook import WebhookUtils
 
 
 # 实例化一个该插件专用的 SessionManager
@@ -213,6 +215,12 @@ class P115StrmHelper(_PluginBase):
             servicer.start_directory_upload()
 
             servicer.start_monitor_life()
+
+        if configer.sync_del_enabled and configer.sync_del_strm_target:
+            try:
+                strm_path_index.start(configer.sync_del_p115_library_path or "")
+            except Exception as error:
+                logger.error(f"【同步删除】STRM 路径索引启动失败，索引模式暂停删除: {error}")
 
         try:
             self.mcp_manager = MCPManager(api=self.api, servicer=servicer)
@@ -1794,6 +1802,20 @@ class P115StrmHelper(_PluginBase):
         if not event or not event.event_data:
             return
 
+        strm_delete_plans = None
+        if configer.sync_del_strm_target:
+            if str(event.event_data.event) != "deep.delete":
+                return
+            item_paths = WebhookUtils.parse_item_paths_from_description(
+                (getattr(event.event_data, "json_object", {}) or {}).get("Description", "")
+            )
+            if event.event_data.item_path:
+                item_paths.append(event.event_data.item_path)
+            strm_delete_plans = {
+                path: strm_path_index.capture(path, configer.sync_del_p115_library_path or "")
+                for path in set(item_paths)
+            }
+
         sync_del_webhook_queue.enqueue(
             SyncDelWebhookTask(
                 event_data=deepcopy(event.event_data),
@@ -1802,6 +1824,7 @@ class P115StrmHelper(_PluginBase):
                 del_source=configer.sync_del_source,
                 p115_library_path=configer.sync_del_p115_library_path,
                 p115_force_delete_files=configer.sync_del_p115_force_delete_files,
+                strm_delete_plans=strm_delete_plans,
             )
         )
 
@@ -2220,6 +2243,7 @@ class P115StrmHelper(_PluginBase):
         退出插件
         """
         type(self)._rename_media_fields_cache.clear()
+        strm_path_index.stop()
         servicer.stop()
         ct_db_manager.close_database()
         U115Patcher().disable()

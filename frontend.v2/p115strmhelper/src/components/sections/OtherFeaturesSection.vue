@@ -47,6 +47,18 @@
           </v-row>
 
           <v-row>
+            <v-col cols="12">
+              <v-switch v-model="config.sync_del_strm_target" label="按 STRM 软链接目标逐文件删除"
+                color="warning" density="compact"
+                hint="默认关闭。开启后先建立本地路径索引；目录删除也仅处理已确认的文件，不会按目录强制删除。需同时挂载媒体库和原始 STRM 目录。"
+                persistent-hint></v-switch>
+              <v-alert v-if="config.sync_del_strm_target" type="info" variant="tonal" density="compact">
+                保存后请等待日志提示“STRM 路径索引就绪”再删除。删除快照仅保留 10 分钟，重启前已删且未记录的文件无法追溯；不确定的路径会跳过。无转移记录仍需开启“强制删除文件”。原始 STRM 和软链接由 Emby 管理，本插件不会额外删除本地软链接。
+              </v-alert>
+            </v-col>
+          </v-row>
+
+          <v-row>
             <v-col cols="12" md="6">
               <v-switch v-model="config.sync_del_remove_versions" label="开启多版本删除" color="info" density="compact" chips
                 closable-chips hint="请查看下方警告提示了解详细说明" persistent-hint></v-switch>

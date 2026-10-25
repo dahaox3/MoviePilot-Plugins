@@ -467,6 +467,7 @@ const config = reactive({
   strm_url_encode: false,
   storage_module: 'u115',
   sync_del_enabled: false,
+  sync_del_strm_target: false,
   sync_del_notify: true,
   sync_del_source: false,
   sync_del_p115_library_path: '',

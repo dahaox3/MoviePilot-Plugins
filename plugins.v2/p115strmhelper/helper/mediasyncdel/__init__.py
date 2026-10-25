@@ -24,6 +24,8 @@ from ...utils.path import PathUtils, PathRemoveUtils
 from ...utils.sentry import sentry_manager
 from ...utils.webhook import WebhookUtils
 
+from .strm_index import StrmDeletePlan, StrmPathIndex, StrmTarget
+
 
 @sentry_manager.capture_all_class_exceptions
 class MediaSyncDelHelper:
@@ -586,13 +588,18 @@ class MediaSyncDelHelper:
             return "", []
         return msg, transfer_history
 
-    def __delete_p115_files(self, storage: str, file_path: str, media_name: str):
+    def __delete_p115_files(
+        self, storage: str, file_path: str, media_name: str, file_only: bool = False
+    ) -> bool:
         """
         删除 115 网盘文件
 
         :param storage (str): 储存类型
         :param file_path (str): 文件路径
         :param media_name (str): 媒体名称
+        :param file_only (bool): 仅允许删除精确的单个文件
+
+        :return bool: 是否完成删除调用
         """
         try:
             if storage not in {"u115", "115网盘Plus", "CloudDrive储存"}:
@@ -603,17 +610,62 @@ class MediaSyncDelHelper:
             )
             if not fileitem:
                 logger.warn(f"【同步删除】{media_name} 网盘媒体不存在：{file_path}")
-                return
+                return False
+            if file_only and fileitem.type != "file":
+                logger.warning(f"【同步删除】精确目标不是普通文件，跳过删除: {file_path}")
+                return False
+            if file_only:
+                if Path(fileitem.path) != Path(file_path):
+                    logger.warning("【同步删除】网盘返回路径与精确目标不符，跳过删除")
+                    return False
+                result = self.storagechain.delete_file(fileitem)
+                if result is True:
+                    logger.info(f"【同步删除】{media_name} 删除网盘媒体文件：{file_path}")
+                return result is True
             if fileitem.type == "dir":
                 # 删除整个文件夹
-                self.storagechain.delete_file(fileitem)
+                result = self.storagechain.delete_file(fileitem)
                 logger.info(f"【同步删除】{media_name} 删除网盘文件夹：{file_path}")
             else:
                 # 调用 MP 模块删除媒体文件和空媒体目录
-                self.storagechain.delete_media_file(fileitem=fileitem)
+                result = self.storagechain.delete_media_file(fileitem=fileitem)
+                if result is False:
+                    return False
                 logger.info(f"【同步删除】{media_name} 删除网盘媒体文件：{file_path}")
+            return result is not False
         except Exception as e:
             logger.error(f"【同步删除】{media_name} 删除网盘媒体 {file_path} 失败: {e}")
+            return False
+
+    def __resolve_strm_remote_file(self, target: StrmTarget) -> Optional[str]:
+        """仅在目标目录中找到唯一同名媒体文件时返回精确路径"""
+        StrmPathIndex.validate(target)
+        path = Path(target.remote)
+        parent = self.storagechain.get_file_item(
+            storage=configer.storage_module, path=path.parent
+        )
+        if not parent or parent.type != "dir":
+            return None
+        mediaext = {ext.lower() for ext in settings.RMT_MEDIAEXT or []}
+        embedded = Path(path.stem).suffix.lower() in mediaext
+        matches = []
+        for item in self.storagechain.list_files(parent) or []:
+            item_path = Path(item.path)
+            if (
+                item.type != "file" or item_path.parent != path.parent
+                or item_path.suffix.lower() not in mediaext
+            ):
+                continue
+            if (embedded and item_path.name == path.stem) or (
+                not embedded and item_path.stem == path.stem
+            ):
+                matches.append(str(item_path))
+        if len(matches) != 1:
+            logger.warning(
+                f"【同步删除】STRM 目标 {target.target} 对应 {len(matches)} 个网盘媒体文件，跳过删除以避免误删"
+            )
+            return None
+        return matches.pop()
 
     def sync_del_by_webhook(
         self,
@@ -623,6 +675,7 @@ class MediaSyncDelHelper:
         del_source: bool,
         p115_library_path: Optional[str],
         p115_force_delete_files: bool,
+        strm_delete_plans: Optional[Dict[str, StrmDeletePlan]] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         通过Webhook事件同步删除媒体
@@ -633,6 +686,7 @@ class MediaSyncDelHelper:
         :param del_source (bool): 是否删除源文件
         :param p115_library_path (str): 115 网盘媒体库路径映射
         :param p115_force_delete_files (bool): 115 网盘强制删除
+        :param strm_delete_plans (Dict): 入队时冻结的 STRM 文件级计划，None 保持原行为
         """
         if not enabled:
             return None
@@ -695,8 +749,57 @@ class MediaSyncDelHelper:
             return None
 
         results = []
+        processed_remote_paths = set()
         for media_path in item_paths:
             if not media_path:
+                continue
+
+            if strm_delete_plans is not None:
+                plan = strm_delete_plans.get(media_path)
+                if plan is None or plan.error:
+                    logger.warning(
+                        f"【同步删除】Emby Item Path={media_path}，已跳过删除以避免误删: "
+                        f"{plan.error if plan else '缺少入队时的路径快照'}"
+                    )
+                    continue
+                for target in plan.targets:
+                    try:
+                        local_history = self.transferhis.get_by_dest(str(target.source))
+                        if local_history and target.linked:
+                            if (
+                                local_history.dest_storage != "local"
+                                or local_history.src_storage != "local"
+                                or local_history.mode != "softlink"
+                                or not local_history.src
+                                or Path(local_history.src).resolve() != target.target
+                            ):
+                                logger.warning("【同步删除】软链接目标与本地整理记录不符，跳过删除")
+                                continue
+                        remote_path = self.__resolve_strm_remote_file(target)
+                        if not remote_path or remote_path in processed_remote_paths:
+                            continue
+                        logger.info(
+                            f"【同步删除】路径追踪：Emby Item Path={media_path}，本地路径={target.source}，"
+                            f"检测到软链接={target.linked}，目标={target.target}，"
+                            f"MoviePilot 映射={target.mapping[1]}，115 网盘映射={target.mapping[2]}，"
+                            f"最终删除文件={remote_path}"
+                        )
+                        StrmPathIndex.validate(target)
+                        result = self.__sync_del(
+                            media_type=media_type, media_name=media_name,
+                            media_path=media_path, tmdb_id=int(tmdb_id) if str(tmdb_id).isdigit() else None,
+                            season_num=season_num, episode_num=episode_num,
+                            media_suffix=None, p115_library_path=p115_library_path,
+                            p115_force_delete_files=p115_force_delete_files,
+                            del_source=del_source, notify=notify, exact_file_path=remote_path,
+                        )
+                        processed_remote_paths.add(remote_path)
+                        if result:
+                            if local_history and target.linked:
+                                self.transferhis.delete(local_history.id)
+                            results.append(result)
+                    except (OSError, RuntimeError, TypeError, ValueError) as error:
+                        logger.warning(f"【同步删除】路径 {target.source} 无法确认，已跳过删除: {error}")
                 continue
 
             media_suffix = None
@@ -780,6 +883,7 @@ class MediaSyncDelHelper:
         p115_force_delete_files: bool,
         del_source: bool,
         notify: bool,
+        exact_file_path: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         执行同步删除
@@ -795,6 +899,7 @@ class MediaSyncDelHelper:
         :param p115_force_delete_files (bool): 115 网盘 强制删除
         :param del_source (bool): 是否删除源文件
         :param notify (bool): 是否通知
+        :param exact_file_path (str): 已确认的网盘单个文件路径，禁止扩大历史查询范围
         """
         if not media_type:
             logger.error(
@@ -809,7 +914,9 @@ class MediaSyncDelHelper:
         image = "https://emby.media/notificationicon.png"
 
         mp_media_path: Optional[Path] = None
-        if p115_library_path:
+        if exact_file_path:
+            media_path = exact_file_path
+        elif p115_library_path:
             _, sub_paths = PathUtils.get_p115_media_path(media_path, p115_library_path)
             if sub_paths:
                 mp_media_path = Path(
@@ -830,21 +937,31 @@ class MediaSyncDelHelper:
             )
             return {}
 
-        msg, transfer_history = self.__get_transfer_his(
-            media_type=media_type,
-            media_name=media_name,
-            media_path=media_path,
-            tmdb_id=tmdb_id,
-            season_num=season_num,
-            episode_num=episode_num,
-        )
+        if exact_file_path:
+            transfer = self.transferhis.get_by_dest(exact_file_path)
+            if transfer and (
+                transfer.dest != exact_file_path
+                or transfer.dest_storage != configer.storage_module
+            ):
+                logger.warning("【同步删除】精确路径与转移记录不符，跳过删除")
+                return {}
+            msg, transfer_history = media_name, [transfer] if transfer else []
+        else:
+            msg, transfer_history = self.__get_transfer_his(
+                media_type=media_type,
+                media_name=media_name,
+                media_path=media_path,
+                tmdb_id=tmdb_id,
+                season_num=season_num,
+                episode_num=episode_num,
+            )
 
         if not msg:
             msg = media_name
 
         logger.info(f"【同步删除】正在同步删除 {msg}")
 
-        if not transfer_history:
+        if not transfer_history and not exact_file_path:
             # 大小写转换二次查询
             msg, transfer_history = self.__get_transfer_his(
                 media_type=media_type,
@@ -856,19 +973,21 @@ class MediaSyncDelHelper:
             )
             if not msg:
                 msg = media_name
-            if not transfer_history:
-                if p115_force_delete_files:
-                    logger.warn(f"【同步删除】{media_name} 强制删除网盘媒体文件")
-                    self.__delete_p115_files(
-                        storage=configer.storage_module,
-                        file_path=media_path,
-                        media_name=media_name,
-                    )
-                else:
-                    logger.warn(
-                        f"【同步删除】{media_type} {media_name} 未获取到可删除数据，请检查路径映射是否配置错误，请检查tmdbid获取是否正确"
-                    )
-                    return {}
+        deleted_exact_file = False
+        if not transfer_history:
+            if p115_force_delete_files:
+                logger.warn(f"【同步删除】{media_name} 强制删除网盘媒体文件")
+                deleted_exact_file = self.__delete_p115_files(
+                    storage=configer.storage_module,
+                    file_path=media_path,
+                    media_name=media_name,
+                    file_only=bool(exact_file_path),
+                )
+            else:
+                logger.warn(
+                    f"【同步删除】{media_type} {media_name} 未获取到可删除数据，请检查路径映射是否配置错误，请检查tmdbid获取是否正确"
+                )
+                return {}
 
         if transfer_history:
             logger.info(
@@ -884,13 +1003,19 @@ class MediaSyncDelHelper:
                 image = transferhis.image or image
                 year = transferhis.year
 
-                self.transferhis.delete(transferhis.id)
-
-                self.__delete_p115_files(
+                if not exact_file_path:
+                    self.transferhis.delete(transferhis.id)
+                deleted = self.__delete_p115_files(
                     storage=transferhis.dest_storage,
                     file_path=transferhis.dest,
                     media_name=media_name,
+                    file_only=bool(exact_file_path),
                 )
+                if exact_file_path and not deleted:
+                    continue
+                deleted_exact_file = deleted_exact_file or deleted
+                if exact_file_path:
+                    self.transferhis.delete(transferhis.id)
 
                 if del_source:
                     if (
@@ -930,6 +1055,8 @@ class MediaSyncDelHelper:
                             except Exception as e:
                                 logger.error(f"【同步删除】删除种子失败：{str(e)}")
 
+        if exact_file_path and not deleted_exact_file:
+            return {}
         logger.info(f"【同步删除】同步删除 {msg} 完成！")
 
         media_type_enum = (
